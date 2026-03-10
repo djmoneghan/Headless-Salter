@@ -1,0 +1,12 @@
+[
+  "(?i)\\bignore\\s+(all\\s+)?(previous|prior|above|earlier)\\s+(instructions?|prompts?|context)\\b",
+  "(?i)\\byou\\s+are\\s+(now\\s+)?(a|an)\\s+\\w+\\b",
+  "(?i)\\byour\\s+(new\\s+)?(instructions?|task|goal|objective|role)\\s+(is|are)\\b",
+  "(?i)\\bdisregard\\s+(all\\s+)?(previous|prior)\\b",
+  "(?i)\\bact\\s+as\\s+(if\\s+you\\s+are|a|an)\\b",
+  "(?i)\\bsystem\\s*:\\s*",
+  "(?i)\\bASSISTANT\\s*:\\s*",
+  "(?i)\\[INST\\]",
+  "(?i)</?\\s*(s|system|human|assistant)\\s*>\\s*",
+  "(?i)\\bdo\\s+not\\s+(follow|obey|adhere\\s+to)\\s+(your|the)\\s+(original\\s+)?(instructions?|rules?|guidelines?)\\b"
+]
