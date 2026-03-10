@@ -558,6 +558,225 @@ def fetch_web_content(
 
 
 # ---------------------------------------------------------------------------
+# PDF Download — Stage A: Content-Type Verification
+# ---------------------------------------------------------------------------
+
+_PDF_CONTENT_TYPES = {"application/pdf", "application/octet-stream"}
+
+
+def stage_verify_pdf_content_type(response_headers: dict, url: str) -> tuple[bool, str]:
+    """
+    Verify the server declared application/pdf (or octet-stream for .pdf URLs).
+    Returns (is_pdf, error_message).
+    Content-Type is checked before any bytes are written to disk.
+    """
+    raw_ct = response_headers.get("Content-Type", "")
+    # Strip parameters (e.g. "application/pdf; charset=...")
+    content_type = raw_ct.split(";")[0].strip().lower()
+
+    if content_type == "application/pdf":
+        return True, ""
+
+    # Permit octet-stream only when URL path ends with .pdf
+    if content_type == "application/octet-stream":
+        parsed = urlparse(url)
+        if parsed.path.lower().endswith(".pdf"):
+            return True, ""
+
+    return False, (
+        f"Rejected: server returned Content-Type '{raw_ct}'. "
+        "Only application/pdf is accepted for PDF downloads."
+    )
+
+
+# ---------------------------------------------------------------------------
+# PDF Download — Stage B: Write to Disk
+# ---------------------------------------------------------------------------
+
+def stage_write_pdf(raw_bytes: bytes, download_dir: str, fetch_timestamp: str) -> tuple[str, str]:
+    """
+    Write raw PDF bytes to a generated filename in download_dir.
+    Filename is always {timestamp}_{random_hex}.pdf — never derived from the URL.
+    Returns (absolute_file_path, error_message).
+    """
+    try:
+        os.makedirs(download_dir, exist_ok=True)
+    except OSError as exc:
+        return "", f"Cannot create download directory '{download_dir}': {exc}"
+
+    if not os.access(download_dir, os.W_OK):
+        return "", f"Download directory '{download_dir}' is not writable."
+
+    # Sanitize timestamp to a safe filename component
+    ts_safe = re.sub(r"[^\w]", "_", fetch_timestamp)
+    rand_hex = secrets.token_hex(8)
+    filename = f"{ts_safe}_{rand_hex}.pdf"
+    file_path = os.path.abspath(os.path.join(download_dir, filename))
+
+    # Double-check the resolved path stays inside download_dir (path traversal guard)
+    abs_download_dir = os.path.abspath(download_dir)
+    if not file_path.startswith(abs_download_dir + os.sep):
+        return "", "Path traversal detected — aborting write."
+
+    try:
+        with open(file_path, "wb") as f:
+            f.write(raw_bytes)
+    except OSError as exc:
+        return "", f"Failed to write PDF to disk: {exc}"
+
+    return file_path, ""
+
+
+# ---------------------------------------------------------------------------
+# PDF Download Pipeline Orchestrator
+# ---------------------------------------------------------------------------
+
+def run_pdf_download_pipeline(url: str, purpose: str, config: dict) -> dict:
+    """
+    Execute the PDF download pipeline (stages 1→2→A→B→audit).
+    Fail-closed: any exception returns success=False, no file written.
+    Text sterilization stages (4–10) do not run — no text is extracted.
+    """
+    fetch_timestamp = datetime.now(timezone.utc).isoformat()
+
+    def _fail(error_msg: str, final_url: str = url) -> dict:
+        logger.error("PDF pipeline fail-closed: %s", error_msg)
+        return {
+            "success": False,
+            "file_path": "",
+            "source_url": final_url,
+            "fetch_timestamp": fetch_timestamp,
+            "file_size_bytes": 0,
+            "audit_log": {
+                "requested_url": url,
+                "final_url": final_url,
+                "fetch_timestamp": fetch_timestamp,
+                "purpose": purpose,
+                "error": error_msg,
+            },
+            "error": error_msg,
+        }
+
+    try:
+        # --- Gate: feature flag ---
+        if not config.get("allow_pdf_download", False):
+            return _fail("PDF download is disabled. Set allow_pdf_download=true in config.")
+
+        download_dir = config.get("pdf_download_dir", "./downloads")
+        # Resolve relative to config file location
+        config_dir = os.path.dirname(os.path.abspath(_CONFIG_PATH))
+        if not os.path.isabs(download_dir):
+            download_dir = os.path.join(config_dir, download_dir)
+
+        # --- Stage 1: URL Validation (reused) ---
+        valid, err = stage_validate_url(url, config)
+        if not valid:
+            return _fail(err)
+
+        # --- Stage 2: HTTP Fetch (reused) ---
+        # We need headers too, so fetch manually to inspect Content-Type before writing.
+        session = requests.Session()
+        session.max_redirects = config["max_redirects"]
+        session.cookies.clear()
+
+        try:
+            response = session.get(
+                url,
+                timeout=config["timeout_seconds"],
+                allow_redirects=True,
+                stream=True,
+                headers={"User-Agent": "web_sterilizer/0.1 (secure-fetch; pdf-download)"},
+            )
+            response.raise_for_status()
+            final_url = response.url
+            response_headers = dict(response.headers)
+        except requests.TooManyRedirects:
+            return _fail(f"Exceeded maximum redirect depth ({config['max_redirects']}).")
+        except requests.Timeout:
+            return _fail(f"Request timed out after {config['timeout_seconds']} seconds.")
+        except requests.RequestException as exc:
+            return _fail(f"HTTP fetch error: {exc}")
+
+        # --- Stage A: Content-Type Verification ---
+        is_pdf, err = stage_verify_pdf_content_type(response_headers, final_url)
+        if not is_pdf:
+            return _fail(err, final_url)
+
+        # --- Byte cap (FR-19 analog) — enforced before writing ---
+        max_bytes = config["max_response_bytes"]
+        raw_bytes = response.raw.read(max_bytes + 1)
+        if len(raw_bytes) > max_bytes:
+            return _fail(
+                f"PDF exceeds maximum allowed size of {max_bytes} bytes. Download aborted.",
+                final_url,
+            )
+
+        # --- Stage B: Write to Disk ---
+        file_path, err = stage_write_pdf(raw_bytes, download_dir, fetch_timestamp)
+        if not file_path:
+            return _fail(err, final_url)
+
+        # --- Audit Log ---
+        audit_log = {
+            "requested_url": url,
+            "final_url": final_url,
+            "fetch_timestamp": fetch_timestamp,
+            "purpose": purpose,
+            "file_size_bytes": len(raw_bytes),
+            "content_type": response_headers.get("Content-Type", ""),
+            "generated_filename": os.path.basename(file_path),
+        }
+
+        logger.info(
+            "PDF download complete | url=%s | file=%s | bytes=%d",
+            final_url, file_path, len(raw_bytes),
+        )
+
+        return {
+            "success": True,
+            "file_path": file_path,
+            "source_url": final_url,
+            "fetch_timestamp": fetch_timestamp,
+            "file_size_bytes": len(raw_bytes),
+            "audit_log": audit_log,
+            "error": None,
+        }
+
+    except Exception as exc:
+        logger.exception("Unhandled exception in PDF download pipeline: %s", exc)
+        return _fail(f"Internal PDF download error: {type(exc).__name__}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# MCP Tool: download_pdf
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def download_pdf(
+    url: str,
+    purpose: str = "",
+) -> dict:
+    """
+    Download a raw PDF file from an allowlisted URL and save it to the
+    configured download directory. No text extraction is performed.
+
+    The destination path and filename are always generated by the server —
+    the agent cannot influence where or under what name the file is saved.
+
+    Args:
+        url: The URL of the PDF to download. Must use http or https scheme.
+        purpose: Optional. Agent's stated reason for this download. Logged only.
+
+    Returns:
+        dict with keys: success, file_path, source_url, fetch_timestamp,
+        file_size_bytes, audit_log, error.
+    """
+    logger.info("download_pdf called | url=%s | purpose=%r", url, purpose)
+    config = load_config()
+    return run_pdf_download_pipeline(url, purpose, config)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
